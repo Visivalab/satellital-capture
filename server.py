@@ -27,10 +27,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if path == "/health":
+            self._send_health()
+            return
         if path == "/" or path == "":
             path = "/index.html"
-        filepath = os.path.join(UI_DIR, path.lstrip("/"))
-        if os.path.isfile(filepath) and filepath.startswith(UI_DIR):
+        filepath = os.path.realpath(os.path.join(UI_DIR, path.lstrip("/")))
+        if os.path.isfile(filepath) and filepath.startswith(UI_DIR + os.sep):
             self._serve_file(filepath)
         else:
             self.send_error(404)
@@ -105,7 +108,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         coords = data.get("coords", "")
         width = str(data.get("width", 1200))
         source = data.get("source", "google")
-        filename = data.get("filename", "capture.tif")
+        # Only keep the base name so the output always stays inside tmp
+        filename = os.path.basename(data.get("filename") or "") or "capture.tif"
         crs = data.get("crs")  # None = auto-detect
 
         if not coords:
@@ -162,6 +166,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_health(self):
+        body = b'{"status":"ok"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_file(self, path):
         ct = "text/html"

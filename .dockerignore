@@ -1,0 +1,11 @@
+.git
+.github
+deployment
+tests
+__pycache__
+*.pyc
+*.tif
+*.tiff
+*.png
+.venv
+venv

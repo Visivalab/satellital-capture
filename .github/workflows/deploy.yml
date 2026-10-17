@@ -1,0 +1,133 @@
+name: Deploy published image
+
+on:
+  workflow_call:
+    inputs:
+      application:
+        type: string
+        required: true
+      image_digest:
+        type: string
+        required: true
+      host:
+        type: string
+        default: ''
+      port:
+        type: string
+        default: '22'
+    secrets:
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_OAUTH_SECRET:
+        required: true
+      DEPLOY_SSH_PRIVATE_KEY:
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        required: true
+  workflow_dispatch:
+    inputs:
+      application:
+        description: Server application allowlist entry
+        required: true
+        default: satellital-capture
+      image_digest:
+        description: Published image digest (sha256 followed by 64 hexadecimal characters)
+        required: true
+      host:
+        description: Leave empty to use the DEPLOY_HOST variable
+        default: ''
+      port:
+        description: OpenSSH port inside the tailnet
+        default: '22'
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy the pinned image
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    concurrency:
+      group: deploy-${{ inputs.application }}
+      cancel-in-progress: false
+    env:
+      DEPLOY_APPLICATION: ${{ inputs.application }}
+      DEPLOY_DIGEST: ${{ inputs.image_digest }}
+      DEPLOY_HOST: ${{ inputs.host || vars.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ inputs.port || '22' }}
+    steps:
+      - name: Validate configuration and prepare the SSH identity
+        env:
+          TS_CLIENT: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          [[ "$DEPLOY_APPLICATION" =~ ^[a-z][a-z0-9-]{0,47}$ ]] || { echo 'Invalid application name'; exit 1; }
+          [[ "$DEPLOY_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'Invalid image digest'; exit 1; }
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || { echo 'Set DEPLOY_HOST to a Tailscale hostname or IPv4 address'; exit 1; }
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || { echo 'Invalid SSH port'; exit 1; }
+          (( 10#$DEPLOY_PORT >= 1 && 10#$DEPLOY_PORT <= 65535 )) || { echo 'Invalid SSH port'; exit 1; }
+          for name in TS_CLIENT TS_SECRET SSH_PRIVATE_KEY SSH_KNOWN_HOSTS; do
+            [[ -n "${!name}" ]] || { echo "Missing deployment credential: $name"; exit 1; }
+          done
+          umask 077
+          directory="$(mktemp -d "$RUNNER_TEMP/deploy-ssh.XXXXXX")"
+          echo "DEPLOY_SSH_DIR=$directory" >> "$GITHUB_ENV"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$directory/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$directory/known_hosts"
+          ssh-keygen -y -P '' -f "$directory/id_ed25519" > /dev/null
+          target="$DEPLOY_HOST"
+          if [[ "$DEPLOY_PORT" != '22' ]]; then target="[$DEPLOY_HOST]:$DEPLOY_PORT"; fi
+          ssh-keygen -F "$target" -f "$directory/known_hosts" > /dev/null || {
+            echo 'DEPLOY_KNOWN_HOSTS does not contain the trusted host key for this destination'; exit 1;
+          }
+
+      - name: Join the private deployment network
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-deploy
+          version: '1.104.1'
+          ping: ${{ env.DEPLOY_HOST }}
+
+      - name: Request the restricted server deployment
+        run: |
+          # Match the explicit IPv4 destination in the tailnet policy.
+          ssh -4 -T \
+            -i "$DEPLOY_SSH_DIR/id_ed25519" \
+            -p "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o "UserKnownHostsFile=$DEPLOY_SSH_DIR/known_hosts" \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o UpdateHostKeys=no \
+            -o HostKeyAlgorithms=ssh-ed25519 \
+            -o PasswordAuthentication=no \
+            -o PreferredAuthentications=publickey \
+            -o ConnectTimeout=20 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            -- "ci-deploy@$DEPLOY_HOST" "deploy $DEPLOY_APPLICATION $DEPLOY_DIGEST"
+
+      - name: Summarize deployment
+        run: |
+          {
+            echo '## Deployment completed'
+            echo
+            echo "Application: \`$DEPLOY_APPLICATION\`"
+            echo
+            echo "Image digest: \`$DEPLOY_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the temporary SSH identity
+        if: always()
+        run: |
+          if [[ -n "${DEPLOY_SSH_DIR:-}" && "$DEPLOY_SSH_DIR" == "$RUNNER_TEMP"/deploy-ssh.* ]]; then
+            rm -rf -- "$DEPLOY_SSH_DIR"
+          fi

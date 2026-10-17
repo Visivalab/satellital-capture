@@ -1,0 +1,12 @@
+{
+  "satellital-capture": {
+    "image": "ghcr.io/visivalab/satellital-capture",
+    "compose_file": "/etc/company-deploy/compose/satellital-capture.yaml",
+    "project_name": "satellital-capture",
+    "service": "satellital-capture",
+    "env_file": "/opt/satellital-capture/.env",
+    "image_variable": "SATELLITAL_CAPTURE_IMAGE",
+    "forward_env": [],
+    "required_env": []
+  }
+}
